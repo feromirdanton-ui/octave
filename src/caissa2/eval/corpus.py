@@ -122,6 +122,34 @@ def generate_corpus(n_positions: int = 400, seed: int = 0, max_plies: int = 40) 
     return items
 
 
+def fast_hanging_loss(board: chess.Board, move: chess.Move) -> int:
+    """A cheap upper bound on what the opponent wins after ``move``.
+
+    Full SEE for every candidate is what made corpus generation take 2.7 s per position. This
+    check is O(pieces) instead of O(moves x SEE): after the move, look for one of our pieces
+    that is attacked by a cheaper (or undefended-by-us) enemy piece. It over-reports slightly,
+    which is fine — it is a *filter* for building a corpus, and the arena still scores with the
+    exact SEE.
+    """
+    after = board.copy()
+    after.push(move)
+    us = after.turn  # the side that just moved is now the opponent of `after.turn`
+    worst = 0
+    for sq, piece in after.piece_map().items():
+        if piece.color != us or piece.piece_type == chess.KING:
+            continue
+        attackers = after.attackers(not us, sq)
+        if not attackers:
+            continue
+        cheapest = min(
+            PIECE_VALUES.get(after.piece_at(a).piece_type, 0) for a in attackers
+        )
+        defenders = after.attackers(us, sq)
+        if not defenders or cheapest < PIECE_VALUES.get(piece.piece_type, 0):
+            worst = max(worst, PIECE_VALUES.get(piece.piece_type, 0) - cheapest)
+    return worst
+
+
 def generate_tactical_corpus(
     n_positions: int = 200, seed: int = 0, max_plies: int = 60
 ) -> list[CorpusItem]:
@@ -135,7 +163,7 @@ def generate_tactical_corpus(
     rng = np.random.default_rng(seed)
     items: list[CorpusItem] = []
     attempts = 0
-    while len(items) < n_positions and attempts < n_positions * 200:
+    while len(items) < n_positions and attempts < n_positions * 40:
         attempts += 1
         board = chess.Board()
         for _ in range(int(rng.integers(8, max_plies))):
@@ -146,9 +174,12 @@ def generate_tactical_corpus(
         if board.is_game_over(claim_draw=True):
             continue
         legal = list(board.legal_moves)
+        # cheap pre-filter first, exact SEE only on the survivors
+        if not any(fast_hanging_loss(board, mv) >= 2 for mv in legal):
+            continue
         if not any(blunder_loss(board, mv) >= 2 for mv in legal):
             continue
-        best = teacher_move(board)
+        best = teacher_move(board, depth=1)
         if blunder_loss(board, best) >= 2:
             continue
         items.append(
