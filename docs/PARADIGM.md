@@ -175,3 +175,83 @@ from a seed alone.
 - **Not a replacement for Caïssa-1.** Caïssa-1 is the reference implementation of the throat and
   the source of the encoder, the mask and the eight axes. Caïssa-2 is a separate project that
   starts from those contracts and changes the architecture around them.
+
+---
+
+## 7. Measurements, and one measurement bug that was found and fixed
+
+The first arena run reported `legality = 0.2` for the guarded player (`C_octave_guard`). That
+was **not** the guard cutting legal moves — it was a defect in the *measurement*.
+
+Stage C built its candidate list by taking the top-12 **raw policy indices** and then discarding
+the illegal ones. The policy is a masked softmax over 4096 from/to indices, so every illegal
+index carries probability exactly 0 — and on a weakly trained net the top of the ranking is full
+of those zeroed entries. The candidate list could therefore come back **empty**, the guarded
+player then chose nothing at all, and "no move" was scored as "illegal move". Legality collapsed
+and the blunder rate was computed over a denominator that included positions where no move was
+made.
+
+The fix is structural, not a threshold tweak: candidates are now built from the **legal move
+list**, ranked by policy probability (`caissa2.eval.arena.top_k_legal_moves`). An empty candidate
+list is impossible, so legality is 1.0 by construction and the guard can only ever reorder or
+cut. Two regression tests pin this down (`test_top_k_legal_moves_never_returns_illegal_or_empty`,
+`test_guarded_player_is_always_legal`).
+
+The head-to-head figure was misleading for a second, unrelated reason: `score_a = 0.5` was
+reported for a match of six **drawn** games. A draw is half a point, so the number was correct
+but uninformative — it read like an even match when nothing had been decided. The match report
+now carries the win/loss/draw split and a `decided` count next to the score.
+
+### Arena after the fix
+
+### Arena (same held-out tactical corpus for every row)
+
+train=200 positions, test=60, epochs=4, trunk=128-D, simulations=12, loop=2x2 games, seed=0
+
+| player | blunder rate | top-1 policy | concept MAE | legality | n |
+|---|---|---|---|---|---|
+| A. throat (Caïssa-1: policy = f(8 concepts)) | 0.367 | 0.083 | 0.2112 | 1.000 | 60 |
+| B. octave (free trunk + concept head, no search) | 0.517 | 0.100 | 0.2006 | 1.000 | 60 |
+| C. octave + guard (concept-derivative filter) | 0.083 | 0.217 | 0.2006 | 1.000 | 60 |
+| D. lattice (PUCT + guard + memory) | 0.000 | 0.217 | 0.2006 | 1.000 | 60 |
+| E. lattice after self-play distillation | 0.000 | 0.250 | 0.1994 | 1.000 | 60 |
+| E'. bare octave after the same distillation | 0.483 | 0.100 | 0.1994 | 1.000 | 60 |
+
+Head-to-head D vs E: 6 games, score 0.50/0.50, W/L/D 0/0/6 (0 decided).
+
+### Self-play distillation rounds
+
+| round | games | samples | mean result | CE | concept MSE | value MSE |
+|---|---|---|---|---|---|---|
+| 0 | 2 | 66 | +0.00 | 0.879 | 0.0136 | 0.1186 |
+| 1 | 2 | 39 | +0.00 | 0.501 | 0.0130 | 0.1277 |
+
+Memory entries: 202. Elapsed: 591.2s.
+
+Reading the table honestly:
+
+- **The throat is the bottleneck, and opening it helps the policy.** `A_throat` (policy = f(8
+  concepts)) reaches top-1 0.083; `B_octave` (free 128-D trunk, concepts as an auxiliary head)
+  reaches 0.100 with a *lower* concept MAE (0.2006 vs 0.2112). The trunk carries information the
+  eight axes cannot express, and the concept head is no worse for being a head.
+- **The bare field is not safe, and it is not supposed to be.** `B_octave` blunders on 51.7% of
+  tactical positions — worse than the throat's 36.7%. A free trunk is more expressive, and an
+  expressive policy trained on 200 positions overfits to confident-looking nonsense. This is the
+  honest cost of opening the throat, and it is exactly why the guard and the search exist.
+- **The guard is the single largest safety gain.** `C_octave_guard` drops the blunder rate from
+  0.517 to 0.083 while *raising* top-1 to 0.217 — it removes the confident blunders and leaves
+  the good moves, which is what a derivative-based cut should do.
+- **Search closes the rest.** `D_lattice` (PUCT + guard + memory) reaches 0.000 blunders at the
+  same top-1 as C, and the self-play loop (`E_lattice_loop`) lifts top-1 to 0.250 and lowers
+  concept MAE to 0.1994 — the loop moves the field toward the player, as designed.
+- **The loop improves the player, not the bare net.** `E_octave_after_loop` still blunders on
+  48.3% of positions. Distillation taught the net to imitate a *search-augmented* player; the
+  net alone does not inherit the search's safety. That is the expected shape of this
+  architecture, and it is worth stating plainly rather than hiding.
+- **Head-to-head D vs E decided nothing:** 6 games, 0 wins, 0 losses, 6 draws (all reaching the
+  ply cap). Both players are deterministic and differ only in the distilled weights, so the
+  match is not evidence of strength either way. The arena numbers above are the measurement;
+  the match is reported for completeness, with its `decided` count so it cannot be misread.
+
+Caveat on scale: 200 training positions, 60 test positions, a 128-D trunk and 12 simulations.
+These are architectural measurements on a CPU, not strength claims.

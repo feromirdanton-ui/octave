@@ -86,3 +86,41 @@ def test_search_does_not_hang_material() -> None:
     mv = search.best_move(board)
     assert mv is not None
     assert worst_material_loss(board, mv)[0] < 2
+
+
+def test_top_k_legal_moves_never_returns_illegal_or_empty() -> None:
+    """Regression: candidates must be built from the legal move list, not from raw top-k indices.
+
+    The mask zeroes every illegal index, so ranking raw indices and filtering afterwards can
+    return an empty candidate list on a weak net — which used to make the guarded player pass
+    and drove measured legality down to 0.2.
+    """
+    import numpy as np
+
+    from caissa2.eval.arena import top_k_legal_moves
+    from caissa2.eval.corpus import generate_tactical_corpus
+    from caissa2.model.features import encode_batch
+
+    net = _net()
+    corpus = generate_tactical_corpus(6, seed=4242)
+    assert corpus
+    for item in corpus:
+        board = chess.Board(item.fen)
+        probs = net.policy(encode_batch([board]), PuctSearch._mask(board))[0]
+        cands = top_k_legal_moves(board, probs, k=12)
+        assert cands, f"empty candidate list for {item.fen}"
+        assert all(mv in board.legal_moves for mv in cands)
+        # best-first: the first candidate is the argmax over legal moves
+        best = max(board.legal_moves, key=lambda mv: probs[mv.from_square * 64 + mv.to_square])
+        assert cands[0].uci() == best.uci()
+
+
+def test_guarded_player_is_always_legal() -> None:
+    """The guard may cut, but it must never leave the player without a legal move."""
+    from caissa2.eval.arena import evaluate_guarded_model
+    from caissa2.eval.corpus import generate_tactical_corpus
+
+    net = _net()
+    corpus = generate_tactical_corpus(6, seed=777)
+    result = evaluate_guarded_model(net, corpus, ConceptGuard(net), name="guard")
+    assert result.legality == 1.0

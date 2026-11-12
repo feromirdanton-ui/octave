@@ -23,7 +23,12 @@ import time
 import chess
 import numpy as np
 
-from caissa2.eval.arena import evaluate_model, evaluate_player, head_to_head
+from caissa2.eval.arena import (
+    evaluate_guarded_model,
+    evaluate_model,
+    evaluate_player,
+    head_to_head,
+)
 from caissa2.eval.corpus import generate_corpus, generate_tactical_corpus
 from caissa2.guard.guard import ConceptGuard
 from caissa2.memory.index import ConceptMemory
@@ -70,56 +75,10 @@ def main(argv: list[str] | None = None) -> int:
     r_throat = evaluate_model(throat, test_corpus, name="A_throat")
     r_octave = evaluate_model(octave, test_corpus, name="B_octave")
 
-    # C: octave + guard as a filter (no search)
+    # C: octave + guard as a filter (no search). Candidates are the top-k *legal* moves, so an
+    # empty candidate list (and the legality collapse it used to cause) is impossible.
     guard = ConceptGuard(octave)
-    blunders = top1 = legal = 0
-    mae = []
-    from caissa2.core.concepts import extract_ground_truth_concepts
-    from caissa2.core.encoding import legal_move_mask
-    from caissa2.eval.corpus import blunder_loss
-    from caissa2.model.features import encode_batch
-
-    for item in test_corpus:
-        board = chess.Board(item.fen)
-        m, _ = legal_move_mask(board)
-        probs = octave.policy(encode_batch([board]), np.asarray(m, dtype=bool)[None, :])[0]
-        order = np.argsort(-probs)
-        candidates: list[chess.Move] = []
-        for idx in order[:12]:
-            frm, to = divmod(int(idx), 64)
-            mv = chess.Move(frm, to)
-            if mv not in board.legal_moves:
-                mv = chess.Move(frm, to, promotion=chess.QUEEN)
-            if mv in board.legal_moves:
-                candidates.append(mv)
-        # the guard is a *relative* test, so it must see the siblings, not one move at a time
-        kept, _ = guard.filter(board, candidates) if candidates else ([], [])
-        chosen = kept[0] if kept else (candidates[0] if candidates else None)
-        if chosen is not None and chosen in board.legal_moves:
-            legal += 1
-            if blunder_loss(board, chosen) >= 2:
-                blunders += 1
-            if chosen.uci() == item.move_uci:
-                top1 += 1
-        mae.append(
-            float(
-                np.mean(
-                    np.abs(
-                        octave.concepts(encode_batch([board]))[0]
-                        - extract_ground_truth_concepts(board).as_array()
-                    )
-                )
-            )
-        )
-    n = len(test_corpus)
-    r_guard = {
-        "name": "C_octave_guard",
-        "blunder_rate": round(blunders / n, 4),
-        "top1": round(top1 / n, 4),
-        "concept_mae": round(float(np.mean(mae)), 4),
-        "legality": round(legal / n, 4),
-        "n": n,
-    }
+    r_guard = evaluate_guarded_model(octave, test_corpus, guard, name="C_octave_guard").as_dict()
 
     print("[5/6] lattice player: search + guard + memory ...", flush=True)
     memory = ConceptMemory(k=8)
