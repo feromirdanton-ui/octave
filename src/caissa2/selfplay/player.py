@@ -36,6 +36,7 @@ class LatticePlayer:
     c_puct: float = 1.6
     seed: int = 0
     name: str = "lattice"
+    controller: object | None = None
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.seed)
@@ -51,10 +52,22 @@ class LatticePlayer:
             seed=self.seed,
         )
 
+    def _budget(self, board: chess.Board) -> int:
+        """Simulations for this position: fixed, or routed by the metacognitive controller."""
+        if self.controller is None:
+            return self.simulations
+        sims, _ = self.controller.budget(board, self.model)
+        return int(sims)
+
     # -- move choice -------------------------------------------------------------
     def policy_distribution(self, board: chess.Board, temperature: float = 0.0) -> dict[str, float]:
         """The player's own distribution over moves — the distillation target."""
         if self.use_search:
+            sims = self._budget(board)
+            if sims != self.search.simulations:
+                # a routed budget is per-position, so the search object is retuned rather than
+                # rebuilt: rebuilding would throw away the tree and the RNG stream
+                self.search.simulations = sims
             return self.search.visit_policy(board, temperature=temperature)
         from caissa2.core.encoding import legal_moves_by_index, move_to_index
         from caissa2.model.features import encode_batch

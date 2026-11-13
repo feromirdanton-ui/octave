@@ -105,9 +105,16 @@ class GuardVerdict:
     material_move: str = ""
     reasons: list[str] = field(default_factory=list)
     z_score: float = 0.0
+    concept_outlier: bool = False
+    corroborated: bool = False
 
     def explain(self) -> str:
         if self.passed:
+            if self.concept_outlier and not self.corroborated:
+                return (
+                    f"PASS {self.move_uci}: concept outlier NOT corroborated "
+                    f"(material {self.material_loss}) — kept"
+                )
             return f"PASS {self.move_uci}: no safety axis is an outlier drop"
         return f"CUT {self.move_uci}: " + "; ".join(self.reasons)
 
@@ -122,12 +129,21 @@ class ConceptGuard:
         min_drop: float = 0.15,
         material_threshold: int = MATERIAL_THRESHOLD,
         use_head: bool = True,
+        concept_corroboration: int = 1,
+        ablate_axes: frozenset[str] | set[str] | None = None,
     ) -> None:
         self.model = model
         self.z_threshold = z_threshold
         self.min_drop = min_drop
         self.material_threshold = material_threshold
         self.use_head = use_head and model is not None
+        #: Minimum SEE material loss that must accompany a concept-axis outlier before the
+        #: concept head is allowed to cut. 0 restores the uncorroborated behaviour.
+        self.concept_corroboration = concept_corroboration
+        #: Axes whose movement is *ignored* by the cut test. This is the counterfactual hook the
+        #: faithfulness protocol needs: "if this axis had not moved, would the guard still cut?"
+        #: It changes the decision only, never the reported deltas.
+        self.ablate_axes = frozenset(ablate_axes or ())
 
     # -- concept measurement -----------------------------------------------------
     def _concepts(self, boards: list[chess.Board]) -> np.ndarray:
@@ -171,6 +187,11 @@ class ConceptGuard:
 
         safety_idx = [list(CONCEPT_NAMES).index(a) for a in SAFETY_AXES]
         drops = -deltas[:, safety_idx]  # positive = axis went down
+        # Ablation: an ablated axis is treated as if it had not moved, so it can neither be the
+        # reason for a cut nor contribute to the outlier statistic.
+        for j, axis in enumerate(SAFETY_AXES):
+            if axis in self.ablate_axes:
+                drops[:, j] = 0.0
         worst_drop = drops.max(axis=1)
 
         # relative outlier test: how far is this move's worst safety drop from its siblings?
@@ -183,16 +204,26 @@ class ConceptGuard:
             v = GuardVerdict(move_uci=mv.uci(), passed=True)
             v.deltas = {name: float(deltas[i, j]) for j, name in enumerate(CONCEPT_NAMES)}
             v.z_score = float(z[i])
-            if z[i] > self.z_threshold and worst_drop[i] > self.min_drop:
-                axis = SAFETY_AXES[int(np.argmax(drops[i]))]
-                v.passed = False
-                v.reasons.append(
-                    f"{axis} {v.deltas[axis]:+.2f} is an outlier drop "
-                    f"(z={z[i]:.1f} vs siblings, median {med:+.2f})"
-                )
             loss, loss_move = worst_material_loss(board, mv)
             v.material_loss = loss
             v.material_move = loss_move
+
+            if z[i] > self.z_threshold and worst_drop[i] > self.min_drop:
+                axis = SAFETY_AXES[int(np.argmax(drops[i]))]
+                v.concept_outlier = True
+                # A concept-axis outlier is a *hypothesis*, not a verdict. Measured on its own
+                # it cuts moves that are BETTER than the alternatives (the cut moves gave up
+                # +2.6 pawns of teacher evaluation on average), so it only fires when the
+                # material lookahead corroborates it. The head sharpens the material guard; it
+                # does not replace it.
+                if loss >= self.concept_corroboration:
+                    v.corroborated = True
+                    v.passed = False
+                    v.reasons.append(
+                        f"{axis} {v.deltas[axis]:+.2f} is an outlier drop "
+                        f"(z={z[i]:.1f} vs siblings, median {med:+.2f}), "
+                        f"corroborated by material -{loss} (SEE)"
+                    )
             if loss >= self.material_threshold:
                 v.passed = False
                 v.reasons.append(f"material -{loss} to {loss_move} (SEE)")

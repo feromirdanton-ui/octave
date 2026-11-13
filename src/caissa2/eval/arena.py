@@ -1,9 +1,15 @@
-"""The arena: four numbers, measured the same way for every model.
+"""The arena: five numbers, measured the same way for every model.
 
 1. **blunder rate** — fraction of chosen moves that lose >= 2 pawns of material by SEE.
-2. **top-1 policy** — fraction of positions where the model's argmax equals the teacher's move.
-3. **concept MAE** — mean absolute error of the concept head against the ground-truth extractor.
-4. **legality** — fraction of chosen moves that are legal (must be 1.0 by construction).
+2. **eval drop** — mean teacher-evaluation loss of the chosen move against the best legal move,
+   in pawns. This is the *independent* safety number, and it exists because of a circularity:
+   the guard's material check and the blunder metric are the same function
+   (``worst_material_loss == blunder_loss`` on every pair we tested), so a guarded player's
+   blunder rate is partly a statement about its own definition. ``eval_drop`` is computed from
+   the teacher's 1-ply evaluation, which the guard never consults, so it can disagree.
+3. **top-1 policy** — fraction of positions where the model's argmax equals the teacher's move.
+4. **concept MAE** — mean absolute error of the concept head against the ground-truth extractor.
+5. **legality** — fraction of chosen moves that are legal (must be 1.0 by construction).
 
 The arena is deliberately engine-free: every number is reproducible from a seed, and the
 blunder definition is a static exchange evaluation rather than an opinion.
@@ -18,8 +24,33 @@ import numpy as np
 
 from caissa2.core.encoding import legal_move_mask, move_to_index
 from caissa2.core.concepts import extract_ground_truth_concepts
-from caissa2.eval.corpus import CorpusItem, blunder_loss
+from caissa2.eval.corpus import CorpusItem, blunder_loss, evaluate
 from caissa2.model.features import encode_batch
+
+
+def move_value(board: chess.Board, move: chess.Move) -> float:
+    """The teacher's 1-ply value of ``move`` for the mover, in pawns."""
+    after = board.copy()
+    after.push(move)
+    return -evaluate(after)
+
+
+def best_move_value(board: chess.Board) -> float:
+    """The teacher's value of the best legal move, in pawns."""
+    return max(move_value(board, mv) for mv in board.legal_moves)
+
+
+def eval_drop(board: chess.Board, move: chess.Move | None, best: float | None = None) -> float:
+    """How much teacher-evaluation the chosen move gives up against the best legal move.
+
+    Independent of the guard: the guard reads the concept head and SEE, this reads the
+    teacher's material+concept evaluation. A move the guard keeps can still be a bad move.
+    """
+    if move is None or move not in board.legal_moves:
+        return float("nan")
+    if best is None:
+        best = best_move_value(board)
+    return float(best - move_value(board, move))
 
 
 @dataclass
@@ -30,12 +61,14 @@ class ArenaResult:
     concept_mae: float
     legality: float
     n: int
+    eval_drop: float = float("nan")
     extra: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
             "name": self.name,
             "blunder_rate": round(self.blunder_rate, 4),
+            "eval_drop": round(self.eval_drop, 4) if self.eval_drop == self.eval_drop else None,
             "top1": round(self.top1, 4),
             "concept_mae": round(self.concept_mae, 4),
             "legality": round(self.legality, 4),
@@ -74,6 +107,7 @@ def evaluate_model(model, corpus: list[CorpusItem], name: str | None = None) -> 
     top1 = 0
     legal = 0
     mae_terms = []
+    drops = []
 
     for i, (board, item) in enumerate(zip(boards, corpus)):
         mask = _mask(board)
@@ -87,6 +121,7 @@ def evaluate_model(model, corpus: list[CorpusItem], name: str | None = None) -> 
             legal += 1
             if blunder_loss(board, move) >= 2:
                 blunders += 1
+            drops.append(eval_drop(board, move))
         if move.uci() == item.move_uci:
             top1 += 1
         pred = model.concepts(x[i : i + 1])[0]
@@ -101,6 +136,7 @@ def evaluate_model(model, corpus: list[CorpusItem], name: str | None = None) -> 
         concept_mae=float(np.mean(mae_terms)) if mae_terms else 0.0,
         legality=legal / max(n, 1),
         n=n,
+        eval_drop=float(np.mean(drops)) if drops else float("nan"),
     )
 
 
@@ -117,6 +153,7 @@ def evaluate_guarded_model(
     top1 = 0
     legal = 0
     mae_terms = []
+    drops = []
 
     for item in corpus:
         board = chess.Board(item.fen)
@@ -128,6 +165,7 @@ def evaluate_guarded_model(
             legal += 1
             if blunder_loss(board, chosen) >= 2:
                 blunders += 1
+            drops.append(eval_drop(board, chosen))
             if chosen.uci() == item.move_uci:
                 top1 += 1
         pred = model.concepts(encode_batch([board]))[0]
@@ -142,6 +180,7 @@ def evaluate_guarded_model(
         concept_mae=float(np.mean(mae_terms)) if mae_terms else 0.0,
         legality=legal / max(n, 1),
         n=n,
+        eval_drop=float(np.mean(drops)) if drops else float("nan"),
     )
 
 
@@ -151,6 +190,7 @@ def evaluate_player(player, corpus: list[CorpusItem], name: str | None = None) -
     top1 = 0
     legal = 0
     mae_terms = []
+    drops = []
 
     for item in corpus:
         board = chess.Board(item.fen)
@@ -159,6 +199,7 @@ def evaluate_player(player, corpus: list[CorpusItem], name: str | None = None) -
             legal += 1
             if blunder_loss(board, move) >= 2:
                 blunders += 1
+            drops.append(eval_drop(board, move))
             if move.uci() == item.move_uci:
                 top1 += 1
         x = encode_batch([board])
@@ -174,7 +215,54 @@ def evaluate_player(player, corpus: list[CorpusItem], name: str | None = None) -
         concept_mae=float(np.mean(mae_terms)) if mae_terms else 0.0,
         legality=legal / max(n, 1),
         n=n,
+        eval_drop=float(np.mean(drops)) if drops else float("nan"),
     )
+
+
+def guard_cut_audit(model, guard, corpus: list[CorpusItem], k: int = 12) -> dict:
+    """Audit the guard's cuts against an independent reference.
+
+    Splits the cuts into the ones the *material* check made and the ones the *concept head* made
+    on its own, and asks of the latter: does the teacher's evaluation agree that the cut move was
+    worse than the best legal move? This is the check that caught the guard cutting good moves.
+    """
+    material_cuts = 0
+    concept_cuts = 0
+    concept_faithful = 0
+    concept_deltas: list[float] = []
+
+    for item in corpus:
+        board = chess.Board(item.fen)
+        probs = model.policy(encode_batch([board]), _mask(board))[0]
+        cands = top_k_legal_moves(board, probs, k=k)
+        if not cands:
+            continue
+        _, cut = guard.filter(board, cands)
+        best = best_move_value(board)
+        for v in cut:
+            mv = chess.Move.from_uci(v.move_uci)
+            if mv not in board.legal_moves:
+                continue
+            if v.material_loss >= guard.material_threshold:
+                material_cuts += 1
+            else:
+                concept_cuts += 1
+                d = eval_drop(board, mv, best=best)
+                concept_deltas.append(d)
+                if d > 0:
+                    concept_faithful += 1
+
+    return {
+        "material_cuts": material_cuts,
+        "concept_cuts": concept_cuts,
+        "concept_cuts_faithful": concept_faithful,
+        "concept_cut_faithfulness": (
+            round(concept_faithful / concept_cuts, 4) if concept_cuts else None
+        ),
+        "concept_cut_mean_eval_drop": (
+            round(float(np.mean(concept_deltas)), 4) if concept_deltas else None
+        ),
+    }
 
 
 def head_to_head(a, b, games: int = 20, max_plies: int = 80, seed: int = 0) -> dict:

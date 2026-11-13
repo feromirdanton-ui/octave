@@ -51,6 +51,7 @@ class Node:
     cuts: list[CutRecord] = field(default_factory=list)
     expanded: bool = False
     depth: int = 0
+    proposals: list[str] = field(default_factory=list)
 
     @property
     def q(self) -> float:
@@ -73,6 +74,8 @@ class PuctSearch:
         memory_weight: float = 0.5,
         guard_depth: int = 1,
         material_threshold: int = 2,
+        memory_proposals: int = 3,
+        proposal_floor: float = 0.08,
     ) -> None:
         self.model = model
         self.guard = guard if guard is not None else ConceptGuard(model)
@@ -85,6 +88,12 @@ class PuctSearch:
         self.memory_weight = memory_weight
         self.guard_depth = guard_depth
         self.material_threshold = material_threshold
+        #: How many memory-proposed moves may be forced into the root's candidate set, and the
+        #: prior floor they get. Without this the memory can only reweight moves the field
+        #: already likes; with it, the memory can make the search *look* at a move the field
+        #: would never have visited.
+        self.memory_proposals = memory_proposals
+        self.proposal_floor = proposal_floor
 
     # -- field -------------------------------------------------------------------
     @staticmethod
@@ -161,6 +170,20 @@ class PuctSearch:
         ]
         kept_ucis = {m.uci() for m in kept}
         kept_prior = {k: v for k, v in prior.items() if k in kept_ucis}
+
+        # Memory as a *director of exploration*, not only a root reweighting. A move the field
+        # ranks at ~0 can never be visited by PUCT no matter how the root is reweighted, so a
+        # confident neighbourhood is allowed to inject its recommendation into the candidate set
+        # with a prior floor. The guard still has the last word: a proposal that the guard cut is
+        # not resurrected.
+        proposed: list[str] = []
+        if node.depth == 0 and self.memory is not None and self.memory_proposals > 0:
+            legal_ucis = {m.uci() for m in kept}
+            proposed = self.memory.propose(board, legal_ucis, top_n=self.memory_proposals)
+            for uci in proposed:
+                kept_prior[uci] = max(kept_prior.get(uci, 0.0), self.proposal_floor)
+            node.proposals = list(proposed)
+
         total = sum(kept_prior.values())
         if total <= 0:
             kept_prior = {k: 1.0 / max(len(kept_ucis), 1) for k in kept_ucis}
@@ -259,6 +282,7 @@ class PuctSearch:
                 {"move": c.move_uci, "axes": {k: round(v, 3) for k, v in c.deltas.items()}}
                 for c in root.cuts
             ],
+            "memory_proposals": list(root.proposals),
         }
 
 

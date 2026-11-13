@@ -150,9 +150,16 @@ deterministic teacher and a deterministic blunder definition:
 | metric | definition |
 |---|---|
 | **blunder rate** | fraction of chosen moves that lose ≥ 2 pawns of material by static exchange evaluation |
+| **eval drop** | mean teacher-evaluation given up against the best legal move, in pawns — the *independent* safety number |
 | **top-1** | fraction of positions where the model's argmax equals the teacher's move |
 | **concept MAE** | mean absolute error of the concept head against the ground-truth extractor |
 | **legality** | fraction of chosen moves that are legal (must be 1.0 by construction) |
+
+`eval_drop` exists because of a circularity that the first report did not see: the guard's
+material check and the blunder metric are **the same function** (`worst_material_loss` and
+`blunder_loss` agree on every pair tested). A guarded player's blunder rate is therefore partly a
+statement about its own definition. `eval_drop` is computed from the teacher's 1-ply evaluation,
+which the guard never consults, so it can disagree — and it does.
 
 The test corpus is **tactical**: it keeps only positions in which at least one legal move loses
 ≥ 2 pawns by SEE and the teacher's move does not. A quiet opening position has no move that
@@ -163,6 +170,73 @@ The teacher is a deterministic 2-ply search over material + concept evaluation. 
 Stockfish and does not pretend to be: it is a fixed, reproducible reference whose moves are good
 enough to supervise a policy and to define a blunder objectively. Every number is reproducible
 from a seed alone.
+
+---
+
+## 5a. The joint control — the baseline step 1 was missing
+
+Step 1 claims that *separating* the measurement from the policy path buys something. The first
+version of this project could not test that claim: its only baseline was `ThroatNet`, the
+eight-number throat, so "octave beats throat" only said "a bigger model beats a smaller one",
+which nobody doubted.
+
+`JointNet` is the control. It has the **same parameter count** as the octave, but the policy
+reads the **concept representation** rather than a free trunk — the concept layer is wide
+(`concept_dim`, default equal to the trunk width) instead of eight. So the question becomes the
+right one: *is the win from opening the throat, or merely from having more parameters?*
+
+The first attempt at this control was wrong in a way worth recording. Its `JointNet` read the
+same free trunk the octave reads, so the two models were the same function and produced
+**bit-identical arena rows** (`B_octave` and `B2_joint_matched` both 0.417 / 0.117 / 0.2000). A
+control that cannot differ from the treatment is worse than no control: it looks like evidence
+and is not. The joint model now routes the policy through the concept layer, and
+`test_joint_and_octave_are_not_the_same_function` asserts the two are not the same function.
+
+---
+
+## 5b. Metacognition — paying for search only where it is needed
+
+The arena saturated: the full lattice player already scores 0.000 blunder rate on the tactical
+corpus, so *more* search cannot show up as a better number. The remaining axis is cost.
+
+`caissa2.meta.controller` predicts, before any search, whether the fast answer is about to be a
+mistake — from cheap features (policy entropy, top-1 margin, concept spread, material, legal-move
+count, guard cut fraction) — and routes a search budget from a fixed tier set `(4, 16, 64)`.
+
+The label is the teacher's evaluation, which the guard never reads, so the predictor is not
+learning the guard's own definition. The honest metric is **AUROC**: 0.5 means the predictor is a
+coin flip and the routing idea is dead for this feature set. It is reported, not assumed.
+
+---
+
+## 5c. Faithfulness — the test we never ran
+
+The guard says "I cut this move because `king_safety` dropped by 0.31, an outlier against its
+siblings". That sentence is only worth something if it is *causally* true of the decision. Two
+standard tests, both cheap, both previously absent (`caissa2.guard.faithfulness`):
+
+- **Ablation (masking).** Re-run the decision with the named axis ignored. If the cut survives,
+  the axis was not the reason. Faithfulness = fraction of cuts that disappear when their own
+  stated axis is ablated.
+- **Shuffle.** Permute the concept deltas across candidates and re-run. A faithful system should
+  change its decisions when its evidence is scrambled; an identical cut set means the guard is
+  not reading the deltas it reports.
+
+Both run against the *same* candidate lists, so the only thing that changes is the evidence.
+`guard_cut_audit` is reported next to them, so a faithful-but-wrong guard cannot hide.
+
+---
+
+## 5d. Memory that directs exploration
+
+Step 4's retrieval prior originally only reweighted the **root**. That is a prior, not a memory:
+if the field assigns a move probability ≈ 0, no amount of root reweighting will ever visit it.
+
+`ConceptMemory.propose` returns moves the neighbourhood recommends and that are legal here, gated
+by `confidence` — the share of neighbourhood weight held by its most-recommended move, scaled by
+how close the nearest neighbour is. A confident neighbourhood gets a **prior floor** at the root,
+so the search actually looks at a move the field would never have visited. The guard still has
+the last word: a proposal the guard cut is not resurrected.
 
 ---
 
@@ -206,52 +280,104 @@ now carries the win/loss/draw split and a `decided` count next to the score.
 
 ### Arena (same held-out tactical corpus for every row)
 
-train=200 positions, test=60, epochs=4, trunk=128-D, simulations=12, loop=2x2 games, seed=0
+train=200 positions, test=60, epochs=6, trunk=128-D, simulations=12, loop=2x3 games, seed=0
 
-| player | blunder rate | top-1 policy | concept MAE | legality | n |
-|---|---|---|---|---|---|
-| A. throat (Caïssa-1: policy = f(8 concepts)) | 0.367 | 0.083 | 0.2112 | 1.000 | 60 |
-| B. octave (free trunk + concept head, no search) | 0.517 | 0.100 | 0.2006 | 1.000 | 60 |
-| C. octave + guard (concept-derivative filter) | 0.083 | 0.217 | 0.2006 | 1.000 | 60 |
-| D. lattice (PUCT + guard + memory) | 0.000 | 0.217 | 0.2006 | 1.000 | 60 |
-| E. lattice after self-play distillation | 0.000 | 0.250 | 0.1994 | 1.000 | 60 |
-| E'. bare octave after the same distillation | 0.483 | 0.100 | 0.1994 | 1.000 | 60 |
+| player | blunder rate | eval drop | top-1 policy | concept MAE | legality | n |
+|---|---|---|---|---|---|---|
+| A. throat (Caïssa-1: policy = f(8 concepts)) | 0.417 | 4.082 | 0.050 | 0.4106 | 1.000 | 60 |
+| B. octave (free trunk + concept head, no search) | 0.417 | 3.483 | 0.117 | 0.2000 | 1.000 | 60 |
+| B2. joint (parameter-matched, policy reads the concept layer) | 0.483 | 3.674 | 0.083 | 0.1888 | 1.000 | 60 |
+| C0. octave + guard, concept head uncorroborated | 0.067 | 2.838 | 0.250 | 0.2000 | 1.000 | 60 |
+| C. octave + guard (corroborated) | 0.067 | 2.838 | 0.250 | 0.2000 | 1.000 | 60 |
+| D. lattice (PUCT + guard + memory) | 0.000 | 2.807 | 0.233 | 0.2000 | 1.000 | 60 |
+| E. lattice after self-play distillation | 0.000 | 2.768 | 0.250 | 0.2055 | 1.000 | 60 |
+| E'. bare octave after the same distillation | 0.400 | 3.510 | 0.117 | 0.2055 | 1.000 | 60 |
+
+Parameters: throat 39,440 · octave 632,072 · joint 632,072 (matched exactly).
 
 Head-to-head D vs E: 6 games, score 0.50/0.50, W/L/D 0/0/6 (0 decided).
+
+### Metacognition
+
+| metric | value | reading |
+|---|---|---|
+| AUROC (predict own error) | 0.530 | **a coin flip** — the feature set does not predict its own mistakes |
+| ECE | 0.659 | badly calibrated |
+| base error rate (test) | 0.750 | the bare policy is wrong on 3 of 4 tactical positions |
+| routed vs fixed budget | 0.000 vs 0.000 blunder, 2.845 vs 2.845 eval drop | same safety |
+| mean simulations | 7.2 vs 12.0 | **40% saved** |
+
+The routing saves 40% of the simulations at identical safety — but the AUROC says *why* that is
+not a win: the predictor is at chance, so the saving comes from the tiers being generous, not
+from knowing where the errors are. On this corpus the honest conclusion is that the controller
+is a **cost knob, not a metacognition**. It needs a corpus where the fast answer is sometimes
+right and sometimes wrong; here it is wrong 75% of the time, so "always search" is nearly optimal
+and there is nothing to route.
+
+### Faithfulness of the guard's explanations
+
+| metric | value | reading |
+|---|---|---|
+| cuts with a stated axis | 6 | all on `piece_activity` |
+| ablation faithfulness | 0.167 | **only 1 of 6 cuts disappears when its own axis is ablated** |
+| shuffle sensitivity | 0.500 | half the cut sets change when the evidence is scrambled |
+
+This is the most uncomfortable number in the report, and it is the one the paper's §5.4 protocol
+exists to produce. The guard's *material* cuts are sound (311 of them, and `guard_cut_audit`
+shows 0.857 of the concept cuts are corroborated by the teacher). But the **axis-level
+explanation** is largely decoration: ablating the named axis removes the cut only 1 time in 6.
+The guard is cutting for the right reason (material) and narrating a concept axis that is not
+what drove the decision. That is exactly the failure mode a faithfulness test is for, and it
+would have gone unnoticed without one.
+
+### Guard cut audit
+
+| variant | material cuts | concept cuts | faithful | mean eval drop of concept cuts |
+|---|---|---|---|---|
+| corroborated | 311 | 7 | 0.857 | 3.749 |
+| uncorroborated | 311 | 13 | 0.846 | 3.024 |
+
+Corroboration removes 6 of 13 concept-only cuts and raises the mean eval drop of the ones it
+keeps — the cuts it removes were the cheaper ones. It does **not** change the arena row
+(C and C0 are identical at 0.067 / 2.838), because on this corpus the material check already
+catches those moves. The corroboration is a correctness fix that this corpus cannot reward.
 
 ### Self-play distillation rounds
 
 | round | games | samples | mean result | CE | concept MSE | value MSE |
 |---|---|---|---|---|---|---|
-| 0 | 2 | 66 | +0.00 | 0.879 | 0.0136 | 0.1186 |
-| 1 | 2 | 39 | +0.00 | 0.501 | 0.0130 | 0.1277 |
+| 0 | 3 | 100 | +0.00 | 0.879 | 0.0136 | 0.1186 |
+| 1 | 3 | 60 | +0.00 | 0.501 | 0.0130 | 0.1277 |
 
-Memory entries: 202. Elapsed: 591.2s.
+Memory entries: 202. Elapsed: 1171.6s.
 
 Reading the table honestly:
 
 - **The throat is the bottleneck, and opening it helps the policy.** `A_throat` (policy = f(8
-  concepts)) reaches top-1 0.083; `B_octave` (free 128-D trunk, concepts as an auxiliary head)
-  reaches 0.100 with a *lower* concept MAE (0.2006 vs 0.2112). The trunk carries information the
-  eight axes cannot express, and the concept head is no worse for being a head.
-- **The bare field is not safe, and it is not supposed to be.** `B_octave` blunders on 51.7% of
-  tactical positions — worse than the throat's 36.7%. A free trunk is more expressive, and an
-  expressive policy trained on 200 positions overfits to confident-looking nonsense. This is the
-  honest cost of opening the throat, and it is exactly why the guard and the search exist.
+  concepts)) reaches top-1 0.050 and concept MAE 0.4106; `B_octave` (free 128-D trunk, concepts
+  as an auxiliary head) reaches 0.117 with MAE 0.2000. The trunk carries information the eight
+  axes cannot express, and the concept head is *better* for being a head, not worse.
+- **The joint control says the win is separation, not capacity.** `B2_joint` has exactly the same
+  632,072 parameters as the octave, but its policy must read the concept layer. It scores 0.483
+  blunder / 0.083 top-1 against the octave's 0.417 / 0.117 — worse on both, at equal capacity.
+  Its concept MAE is slightly better (0.1888), which is what you would expect: when the policy
+  and the measurement share one path, the measurement is easier to fit and the policy is harder.
+  **This is the evidence step 1 was missing**, and it points the right way.
+- **The bare field is not safe, and it is not supposed to be.** `B_octave` blunders on 41.7% of
+  tactical positions. A free trunk is more expressive, and an expressive policy trained on 200
+  positions overfits to confident-looking nonsense. This is the honest cost of opening the
+  throat, and it is exactly why the guard and the search exist.
 - **The guard is the single largest safety gain.** `C_octave_guard` drops the blunder rate from
-  0.517 to 0.083 while *raising* top-1 to 0.217 — it removes the confident blunders and leaves
-  the good moves, which is what a derivative-based cut should do.
-- **Search closes the rest.** `D_lattice` (PUCT + guard + memory) reaches 0.000 blunders at the
-  same top-1 as C, and the self-play loop (`E_lattice_loop`) lifts top-1 to 0.250 and lowers
-  concept MAE to 0.1994 — the loop moves the field toward the player, as designed.
+  0.417 to 0.067 and eval drop from 3.483 to 2.838 while *raising* top-1 to 0.250.
+- **Search closes the rest.** `D_lattice` (PUCT + guard + memory) reaches 0.000 blunders, and the
+  self-play loop (`E_lattice_loop`) lifts top-1 to 0.250 and lowers eval drop to 2.768.
 - **The loop improves the player, not the bare net.** `E_octave_after_loop` still blunders on
-  48.3% of positions. Distillation taught the net to imitate a *search-augmented* player; the
-  net alone does not inherit the search's safety. That is the expected shape of this
-  architecture, and it is worth stating plainly rather than hiding.
+  40.0% of positions. Distillation taught the net to imitate a *search-augmented* player; the net
+  alone does not inherit the search's safety. That is the expected shape of this architecture.
 - **Head-to-head D vs E decided nothing:** 6 games, 0 wins, 0 losses, 6 draws (all reaching the
   ply cap). Both players are deterministic and differ only in the distilled weights, so the
-  match is not evidence of strength either way. The arena numbers above are the measurement;
-  the match is reported for completeness, with its `decided` count so it cannot be misread.
+  match is not evidence of strength either way.
 
 Caveat on scale: 200 training positions, 60 test positions, a 128-D trunk and 12 simulations.
-These are architectural measurements on a CPU, not strength claims.
+These are architectural measurements on a CPU, not strength claims. The 60-position test set
+gives ±0.12 on a blunder rate near 0.4, so differences smaller than that are not resolved.

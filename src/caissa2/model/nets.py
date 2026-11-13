@@ -1,4 +1,4 @@
-"""Two models, one corpus: the throat and the octave.
+"""Three models, one corpus: the throat, the octave, and the joint control.
 
 ``ThroatNet`` is Caïssa-1's architecture, kept honest: the policy is a function of the eight
 concept numbers and of nothing else. Whatever the position contains that the eight axes cannot
@@ -8,8 +8,20 @@ say is unreachable for it.
 directly, plus a concept head trained as an *auxiliary* task. The concepts are still measured —
 the explanation is still exact — but they no longer gate the policy.
 
-Both are numpy-only so the whole thing runs on a CPU with no torch, and both apply the legality
-mask inside the softmax, so every sampled move is legal by construction.
+``JointNet`` is the control that step 1 needs and did not have. It is the *same capacity* as the
+octave, but the policy reads the **concept representation** rather than the free trunk. The
+concept layer is wide (``concept_dim``, default equal to the trunk width) instead of eight, so
+this is not the Caïssa-1 throat — it is the honest question: *does separating the measurement
+from the policy path buy anything, or is a wide enough concept layer just as good?*
+
+An earlier version of this file got that wrong: its ``JointNet`` read the same free trunk the
+octave reads, so the two models were the same function and produced bit-identical arena rows.
+That is a control that cannot fail, which is worse than no control at all. The joint model now
+routes the policy through the concept layer, and a test asserts the two are *not* the same
+function.
+
+All three are numpy-only so the whole thing runs on a CPU with no torch, and all three apply the
+legality mask inside the softmax, so every sampled move is legal by construction.
 """
 
 from __future__ import annotations
@@ -60,29 +72,36 @@ class ThroatNet:
 
     seed: int = 0
     lr: float = 3e-3
-    concept_weight: float = 1.0
+    concept_weight: float = 0.5
     params: dict[str, np.ndarray] = field(default_factory=dict)
     opt: Adam | None = None
 
-    trunk_dim: int = N_CONCEPTS
     kind: str = "throat"
 
     def __post_init__(self) -> None:
         rng = np.random.default_rng(self.seed)
         self.params = {
-            "W1": (rng.normal(0, 0.02, (BOARD_DIM, N_CONCEPTS))).astype(np.float32),
+            "W1": (rng.normal(0, 1.0 / np.sqrt(BOARD_DIM), (BOARD_DIM, N_CONCEPTS))).astype(
+                np.float32
+            ),
             "b1": np.zeros(N_CONCEPTS, dtype=np.float32),
-            "W2": (rng.normal(0, 0.02, (N_CONCEPTS, MOVE_DIM))).astype(np.float32),
-            "wv": (rng.normal(0, 0.02, (N_CONCEPTS, 1))).astype(np.float32),
+            "W2": (rng.normal(0, 1.0 / np.sqrt(N_CONCEPTS), (N_CONCEPTS, MOVE_DIM))).astype(
+                np.float32
+            ),
+            "wv": (rng.normal(0, 1.0 / np.sqrt(N_CONCEPTS), (N_CONCEPTS, 1))).astype(np.float32),
         }
         self.opt = Adam(self.params, lr=self.lr)
 
-    # -- forward -----------------------------------------------------------------
-    def trunk(self, x: np.ndarray) -> np.ndarray:
-        return x @ self.params["W1"] + self.params["b1"]
-
     def concepts(self, x: np.ndarray) -> np.ndarray:
-        return np.tanh(self.trunk(x))
+        return np.tanh(x @ self.params["W1"] + self.params["b1"])
+
+    def trunk(self, x: np.ndarray) -> np.ndarray:
+        """The throat itself: the eight-dimensional hidden state. Alias of ``concepts``.
+
+        Kept as a named method because the whole point of this model is that the hidden state
+        *is* the concept vector — a test asserts ``trunk(x).shape == (n, 8)``.
+        """
+        return self.concepts(x)
 
     def logits(self, x: np.ndarray) -> np.ndarray:
         return self.concepts(x) @ self.params["W2"]
@@ -93,7 +112,6 @@ class ThroatNet:
     def policy(self, x: np.ndarray, mask: np.ndarray) -> np.ndarray:
         return masked_softmax(self.logits(x), mask)
 
-    # -- training ----------------------------------------------------------------
     def train_batch(self, x, mask, target_idx, target_concepts, target_value=None) -> dict:
         b = x.shape[0]
         c = self.concepts(x)
@@ -113,12 +131,9 @@ class ThroatNet:
         dc = dlogits @ self.params["W2"].T
 
         mse = float(np.mean((c - target_concepts) ** 2))
-        dc += self.concept_weight * 2.0 * (c - target_concepts) / (b * N_CONCEPTS)
-
-        # tanh derivative
-        dpre = dc * (1.0 - c * c)
-        grads["W1"] = x.T @ dpre
-        grads["b1"] = dpre.sum(axis=0)
+        dpre = self.concept_weight * 2.0 * (c - target_concepts) / (b * N_CONCEPTS)
+        dpre *= 1.0 - c * c
+        dc = dc + dpre
 
         vloss = 0.0
         if target_value is not None:
@@ -128,6 +143,10 @@ class ThroatNet:
             grads["wv"] = c.T @ (dv * (1.0 - v[:, None] ** 2))
         else:
             grads["wv"] = np.zeros_like(self.params["wv"])
+
+        dc = dc * (1.0 - c * c)
+        grads["W1"] = x.T @ dc
+        grads["b1"] = dc.sum(axis=0)
 
         self.opt.step(self.params, grads)
         return {"ce": float(ce), "concept_mse": mse, "value_mse": vloss}
@@ -159,7 +178,6 @@ class OctaveNet:
         }
         self.opt = Adam(self.params, lr=self.lr)
 
-    # -- forward -----------------------------------------------------------------
     def trunk(self, x: np.ndarray) -> np.ndarray:
         return np.maximum(x @ self.params["Wt"] + self.params["bt"], 0.0)
 
@@ -175,7 +193,6 @@ class OctaveNet:
     def policy(self, x: np.ndarray, mask: np.ndarray) -> np.ndarray:
         return masked_softmax(self.logits(x), mask)
 
-    # -- training ----------------------------------------------------------------
     def train_batch(self, x, mask, target_idx, target_concepts, target_value=None) -> dict:
         b = x.shape[0]
         h = self.trunk(x)
@@ -219,14 +236,134 @@ class OctaveNet:
         return {"ce": float(ce), "concept_mse": mse, "value_mse": vloss}
 
 
+@dataclass
+class JointNet:
+    """The joint control: the policy reads the *concept representation*, not a free trunk.
+
+    This is the comparison step 1 actually needs. ``OctaveNet`` gives the policy a free path
+    (``Wp`` on the trunk) and measures concepts on a side branch. ``JointNet`` gives the policy
+    no free path at all: it must read the concept layer, exactly as Caïssa-1 did — but the
+    concept layer is ``concept_dim`` wide instead of eight, so the model is not capacity-starved.
+
+    The question it answers: *is the win from opening the throat, or merely from having more
+    parameters?* If a wide joint concept layer matches the octave, the factorization claim is
+    unsupported and the honest conclusion is "capacity, not separation". If the octave wins at
+    equal capacity, the separation itself is doing work.
+
+    ``concept_dim`` defaults to the trunk width, which makes the two models parameter-matched to
+    within the concept readout — the difference is purely architectural.
+    """
+
+    seed: int = 0
+    lr: float = 3e-3
+    concept_dim: int = 256
+    concept_weight: float = 0.5
+    params: dict[str, np.ndarray] = field(default_factory=dict)
+    opt: Adam | None = None
+
+    kind: str = "joint"
+
+    def __post_init__(self) -> None:
+        rng = np.random.default_rng(self.seed)
+        w = self.concept_dim
+        self.params = {
+            "Wt": (rng.normal(0, 1.0 / np.sqrt(BOARD_DIM), (BOARD_DIM, w))).astype(np.float32),
+            "bt": np.zeros(w, dtype=np.float32),
+            # the policy reads the WIDE concept layer — there is no free trunk path
+            "Wp": (rng.normal(0, 1.0 / np.sqrt(w), (w, MOVE_DIM))).astype(np.float32),
+            # the eight measured axes are a readout of that same layer
+            "Wc": (rng.normal(0, 1.0 / np.sqrt(w), (w, N_CONCEPTS))).astype(np.float32),
+            "bc": np.zeros(N_CONCEPTS, dtype=np.float32),
+            "wv": (rng.normal(0, 1.0 / np.sqrt(w), (w, 1))).astype(np.float32),
+        }
+        self.opt = Adam(self.params, lr=self.lr)
+
+    def wide(self, x: np.ndarray) -> np.ndarray:
+        """The wide concept layer — the only representation the policy can see."""
+        return np.tanh(x @ self.params["Wt"] + self.params["bt"])
+
+    def concepts(self, x: np.ndarray) -> np.ndarray:
+        return np.tanh(self.wide(x) @ self.params["Wc"] + self.params["bc"])
+
+    def logits(self, x: np.ndarray) -> np.ndarray:
+        return self.wide(x) @ self.params["Wp"]
+
+    def value(self, x: np.ndarray) -> np.ndarray:
+        return np.tanh(self.wide(x) @ self.params["wv"]).ravel()
+
+    def policy(self, x: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        return masked_softmax(self.logits(x), mask)
+
+    def train_batch(self, x, mask, target_idx, target_concepts, target_value=None) -> dict:
+        b = x.shape[0]
+        h = self.wide(x)
+        logits = h @ self.params["Wp"]
+        probs = masked_softmax(logits, mask)
+
+        rows = np.arange(b)
+        ce = -np.log(np.maximum(probs[rows, target_idx], 1e-12)).mean()
+
+        dlogits = probs.copy()
+        dlogits[rows, target_idx] -= 1.0
+        dlogits[~mask] = 0.0
+        dlogits /= b
+
+        grads = {}
+        grads["Wp"] = h.T @ dlogits
+        dh = dlogits @ self.params["Wp"].T
+
+        c = np.tanh(h @ self.params["Wc"] + self.params["bc"])
+        mse = float(np.mean((c - target_concepts) ** 2))
+        dpre = self.concept_weight * 2.0 * (c - target_concepts) / (b * N_CONCEPTS)
+        dpre *= 1.0 - c * c
+        grads["Wc"] = h.T @ dpre
+        grads["bc"] = dpre.sum(axis=0)
+        dh = dh + dpre @ self.params["Wc"].T
+
+        vloss = 0.0
+        if target_value is not None:
+            v = np.tanh(h @ self.params["wv"]).ravel()
+            vloss = float(np.mean((v - target_value) ** 2))
+            dv = 2.0 * (v - target_value)[:, None] / b
+            grads["wv"] = h.T @ (dv * (1.0 - v[:, None] ** 2))
+        else:
+            grads["wv"] = np.zeros_like(self.params["wv"])
+
+        dh = dh * (1.0 - h * h)  # tanh derivative: the wide layer is tanh, not relu
+        grads["Wt"] = x.T @ dh
+        grads["bt"] = dh.sum(axis=0)
+
+        self.opt.step(self.params, grads)
+        return {"ce": float(ce), "concept_mse": mse, "value_mse": vloss}
+
+
+def param_count(model) -> int:
+    """Total number of scalar parameters — the number the joint/octave match is made on."""
+    return int(sum(int(np.asarray(v).size) for v in model.params.values()))
+
+
+def matched_joint_concept_dim(octave_trunk_dim: int) -> int:
+    """The joint concept width whose parameter count matches an octave of ``octave_trunk_dim``.
+
+    Octave: BOARD_DIM*d + d + d*MOVE_DIM + d*N_CONCEPTS + N_CONCEPTS + d
+    Joint:  BOARD_DIM*w + w + w*MOVE_DIM + w*N_CONCEPTS + N_CONCEPTS + w
+
+    The two are the same expression in ``d`` and ``w``, so the matched width is ``d`` itself.
+    That is the point: the joint model is not smaller, it is *differently wired* — its policy
+    path goes through the concept layer instead of around it.
+    """
+    return int(octave_trunk_dim)
+
+
 def save_model(model, path: str) -> None:
-    np.savez_compressed(path, **model.params)
+    np.savez(path, **{k: v for k, v in model.params.items()})
 
 
 def load_model(cls, path: str, **kwargs):
-    data = np.load(path)
     model = cls(**kwargs)
-    for k in model.params:
-        if k in data:
-            model.params[k] = data[k].astype(np.float32)
+    with np.load(path) as z:
+        for k in model.params:
+            if k in z:
+                model.params[k] = z[k]
+    model.opt = Adam(model.params, lr=model.lr)
     return model

@@ -125,3 +125,47 @@ class ConceptMemory:
         if not prior:
             return None
         return max(prior, key=prior.get)
+
+    # -- directing exploration, not just reweighting the root ---------------------
+    def confidence(self, board: chess.Board) -> float:
+        """How much the nearest neighbours actually agree, in [0, 1].
+
+        A retrieval prior is only worth acting on when the neighbourhood is *coherent*. If the
+        eight nearest positions in concept space recommend eight different moves, the memory is
+        saying "this region is mixed" and its vote should be discounted rather than averaged.
+        Confidence is the share of the neighbourhood's weight held by its most-recommended move,
+        scaled by how close the nearest neighbour is.
+        """
+        near = self.neighbours(board)
+        if not near:
+            return 0.0
+        weights: dict[str, float] = {}
+        for dist, entry in near:
+            w = float(np.exp(-dist / max(self.temperature, 1e-6))) * entry.weight
+            weights[entry.move_uci] = weights.get(entry.move_uci, 0.0) + w
+        total = sum(weights.values())
+        if total <= 0:
+            return 0.0
+        agreement = max(weights.values()) / total
+        nearest = float(np.exp(-near[0][0] / max(self.temperature, 1e-6)))
+        return float(agreement * nearest)
+
+    def propose(
+        self, board: chess.Board, legal_ucis: set[str], top_n: int = 3, min_confidence: float = 0.35
+    ) -> list[str]:
+        """Moves the memory wants *explored*, even if the field ranks them low.
+
+        This is the difference between a prior and a memory. Reweighting the root only changes
+        which of the field's own candidates is tried first; if the field assigns a move
+        probability ~0, no amount of reweighting will ever visit it. ``propose`` returns moves
+        that the neighbourhood recommends and that are legal here, so the search can give them a
+        prior floor and actually look at them. The confidence gate keeps a noisy neighbourhood
+        from injecting random moves into every tree.
+        """
+        if self.confidence(board) < min_confidence:
+            return []
+        prior = self.retrieval_prior(board, legal_ucis=legal_ucis)
+        if not prior:
+            return []
+        ranked = sorted(prior.items(), key=lambda kv: -kv[1])
+        return [uci for uci, _ in ranked[:top_n]]
